@@ -1,8 +1,8 @@
 """
 쇼핑검색광고 대시보드 - 데이터 변환기
 
-원본 리포트(엑셀/CSV)를 대시보드용 CSV(shopping_ad_daily.csv, category_daily.csv)로 변환합니다.
-두 원본 모두 "매번 전체 누적 기간을 다시 추출"하는 형태이므로, 새 원본을 받을 때마다
+원본 리포트(엑셀/CSV)를 대시보드용 CSV(tableau_daily.csv, category_daily.csv)로 변환합니다.
+모든 원본이 "매번 전체 누적 기간을 다시 추출"하는 형태이므로, 새 원본을 받을 때마다
 그냥 다시 변환해서 기존 CSV를 통째로 교체하면 됩니다. (증분 병합 불필요)
 """
 
@@ -14,7 +14,7 @@ st.set_page_config(page_title="쇼핑검색광고 데이터 변환기", layout="
 st.title("🔄 쇼핑검색광고 데이터 변환기")
 st.caption("원본 리포트를 업로드하면 대시보드용 CSV를 만들어 다운로드할 수 있습니다.")
 
-tab1, tab2 = st.tabs(["① 일별 실적 (shopping_ad_daily.csv)", "② 카테고리별 실적 (category_daily.csv)"])
+tab1, tab2 = st.tabs(["① 일일리포트[태블로] (tableau_daily.csv)", "② 카테고리별 실적 (category_daily.csv)"])
 
 
 def to_csv_bytes(df: pd.DataFrame) -> bytes:
@@ -28,15 +28,32 @@ def check_missing_dates(dates: pd.Series) -> list:
 
 
 # ════════════════════════════════════════════════════════════════
-# TAB 1: 일별 실적 (일일리포트_쇼핑검색광고_RAW.xlsx)
+# TAB 1: 일일리포트[태블로] 일자별 RAW → 01(실적 흐름)/02(전년비교) 페이지의 기준 데이터
 # ════════════════════════════════════════════════════════════════
 with tab1:
     st.markdown("""
-    **원본 파일**: `일일리포트_쇼핑검색광고_RAW.xlsx` (네이버 쇼핑검색광고 일일 리포트, 1번째 시트)
-    매번 전체 누적 기간이 다시 추출되는 형태이므로, 새로 받은 파일을 그대로 올리면 됩니다.
+    **원본 파일**: 일일리포트[태블로] 일자별 RAW 엑셀 (거래액·구매건수 등 전체 큰 흐름 기준)
+    맨 아래 "총합계" 같은 합계 행이 있어도 자동으로 제외합니다.
+
+    **고정 구간 + 증분 업데이트**: 특정 날짜까지는 확정된(고정) 실적이라 값이 바뀌지 않는다면,
+    아래에 기존 `tableau_daily.csv`를 같이 올려주세요. 고정 기준일 **이전** 데이터는 기존 파일 값을
+    그대로 유지하고, 기준일 **이후** 데이터만 새로 올린 원본 값으로 채우거나 덮어씁니다.
+    기존 파일 없이 원본만 올리면 예전처럼 전체를 새로 변환합니다.
     """)
 
-    daily_file = st.file_uploader("원본 엑셀 업로드 (.xlsx)", type=["xlsx"], key="daily_upload")
+    c1, c2 = st.columns(2)
+    with c1:
+        daily_file = st.file_uploader("① 원본 엑셀 업로드 (.xlsx)", type=["xlsx"], key="daily_upload")
+    with c2:
+        existing_file = st.file_uploader(
+            "② 기존 tableau_daily.csv 업로드 (선택 — 있으면 고정구간 병합)",
+            type=["csv"], key="existing_upload",
+        )
+
+    fixed_cutoff = st.date_input(
+        "🔒 고정 기준일 (이 날짜까지는 기존 파일 값을 그대로 유지)",
+        value=pd.Timestamp("2026-07-31"), key="fixed_cutoff",
+    )
 
     if daily_file is not None:
         try:
@@ -54,12 +71,47 @@ with tab1:
 
         def _parse_date(s):
             date_part = str(s).split(" ")[0]
-            return pd.to_datetime(date_part, format="%y-%m-%d")
+            try:
+                return pd.to_datetime(date_part, format="%y-%m-%d")
+            except (ValueError, TypeError):
+                return pd.NaT
 
         raw["date"] = raw["기간_일자+요일"].apply(_parse_date)
+        n_dropped = raw["date"].isna().sum()
+        raw = raw.dropna(subset=["date"])
         result = raw.sort_values("date").reset_index(drop=True)
+        if n_dropped:
+            st.caption(f"※ 원본에서 날짜로 해석되지 않는 행 {n_dropped}개(합계 행 등)는 제외했습니다.")
 
-        st.success(f"변환 완료: {len(result):,}행 · {result['date'].min().date()} ~ {result['date'].max().date()}")
+        cutoff_ts = pd.Timestamp(fixed_cutoff)
+
+        if existing_file is not None:
+            try:
+                existing = pd.read_csv(existing_file, parse_dates=["date"])
+            except Exception as e:
+                st.error(f"기존 CSV 읽기 실패: {e}")
+                st.stop()
+
+            missing_cols = set(existing.columns) - set(result.columns)
+            if missing_cols:
+                st.warning(f"⚠️ 기존 파일에는 있지만 새 원본엔 없는 컬럼: {sorted(missing_cols)} — 새 원본 기준 컬럼으로 맞춥니다.")
+
+            fixed_part = existing[existing["date"] <= cutoff_ts]
+            new_part = result[result["date"] > cutoff_ts]
+            # 컬럼을 새 원본 기준으로 통일 (기존 파일에 없는 컬럼은 NaN)
+            fixed_part = fixed_part.reindex(columns=result.columns)
+            result = pd.concat([fixed_part, new_part], ignore_index=True).sort_values("date").reset_index(drop=True)
+
+            st.success(
+                f"병합 완료: 고정구간 {len(fixed_part):,}행"
+                f"({fixed_part['date'].min().date() if len(fixed_part) else '-'}~{fixed_part['date'].max().date() if len(fixed_part) else '-'}) "
+                f"+ 신규구간 {len(new_part):,}행"
+                f"({new_part['date'].min().date() if len(new_part) else '-'}~{new_part['date'].max().date() if len(new_part) else '-'}) "
+                f"= 총 {len(result):,}행"
+            )
+        else:
+            st.success(f"변환 완료: {len(result):,}행 · {result['date'].min().date()} ~ {result['date'].max().date()}")
+            st.caption("※ 기존 파일을 올리지 않아 전체를 새로 변환했습니다. 다음부터 고정구간 병합을 쓰려면 ②에 이 결과 파일을 올려주세요.")
 
         missing = check_missing_dates(result["date"])
         if missing:
@@ -71,13 +123,13 @@ with tab1:
         st.dataframe(result.head(10), use_container_width=True)
 
         st.download_button(
-            "📥 shopping_ad_daily.csv 다운로드",
+            "📥 tableau_daily.csv 다운로드",
             data=to_csv_bytes(result),
-            file_name="shopping_ad_daily.csv",
+            file_name="tableau_daily.csv",
             mime="text/csv",
             key="dl_daily",
         )
-        st.info("다운로드한 파일로 GitHub 리포의 `data/shopping_ad_daily.csv`를 교체(덮어쓰기)하면 됩니다.")
+        st.info("다운로드한 파일로 GitHub 리포의 `data/tableau_daily.csv`를 교체(덮어쓰기)하면 됩니다.")
 
 
 # ════════════════════════════════════════════════════════════════
