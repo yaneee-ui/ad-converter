@@ -7,12 +7,18 @@
 """
 
 import io
+import os
 import streamlit as st
 import pandas as pd
 
 st.set_page_config(page_title="쇼핑검색광고 데이터 변환기", layout="wide")
 st.title("🔄 쇼핑검색광고 데이터 변환기")
 st.caption("원본 리포트를 업로드하면 대시보드용 CSV를 만들어 다운로드할 수 있습니다.")
+
+# 이 변환기가 대시보드와 같은 리포에서 실행 중이면(로컬 클론 또는 Streamlit Cloud 배포),
+# data/tableau_daily.csv가 이미 디스크에 있으므로 매번 다시 업로드하지 않아도 자동으로 찾아 씁니다.
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+_AUTO_TABLEAU_PATH = os.path.join(_BASE_DIR, "data", "tableau_daily.csv")
 
 tab1, tab2 = st.tabs(["① 일일리포트[태블로] (tableau_daily.csv)", "② 카테고리별 실적 (category_daily.csv)"])
 
@@ -31,22 +37,28 @@ def check_missing_dates(dates: pd.Series) -> list:
 # TAB 1: 일일리포트[태블로] 일자별 RAW → 01(실적 흐름)/02(전년비교) 페이지의 기준 데이터
 # ════════════════════════════════════════════════════════════════
 with tab1:
+    auto_found = os.path.exists(_AUTO_TABLEAU_PATH)
+
     st.markdown("""
     **원본 파일**: 일일리포트[태블로] 일자별 RAW 엑셀 (거래액·구매건수 등 전체 큰 흐름 기준)
     맨 아래 "총합계" 같은 합계 행이 있어도 자동으로 제외합니다.
 
     **고정 구간 + 증분 업데이트**: 특정 날짜까지는 확정된(고정) 실적이라 값이 바뀌지 않는다면,
-    아래에 기존 `tableau_daily.csv`를 같이 올려주세요. 고정 기준일 **이전** 데이터는 기존 파일 값을
-    그대로 유지하고, 기준일 **이후** 데이터만 새로 올린 원본 값으로 채우거나 덮어씁니다.
-    기존 파일 없이 원본만 올리면 예전처럼 전체를 새로 변환합니다.
+    고정 기준일 **이전** 데이터는 기존 파일 값을 그대로 유지하고, 기준일 **이후** 데이터만
+    새로 올린 원본 값으로 채우거나 덮어씁니다.
     """)
+
+    if auto_found:
+        st.success(f"✅ 이 리포에 있는 `data/tableau_daily.csv`를 기존 파일로 자동 인식했습니다. 매번 다시 올리지 않아도 됩니다.")
+    else:
+        st.info("이 환경에서는 `data/tableau_daily.csv`를 찾지 못했습니다 (로컬에서 리포 폴더 밖에서 실행했거나, 별도 환경일 수 있어요). 아래에 기존 파일을 직접 올려주세요.")
 
     c1, c2 = st.columns(2)
     with c1:
         daily_file = st.file_uploader("① 원본 엑셀 업로드 (.xlsx)", type=["xlsx"], key="daily_upload")
     with c2:
         existing_file = st.file_uploader(
-            "② 기존 tableau_daily.csv 업로드 (선택 — 있으면 고정구간 병합)",
+            "② 기존 tableau_daily.csv 업로드 (자동 인식 안 될 때만, 또는 다른 파일로 덮어쓰고 싶을 때)",
             type=["csv"], key="existing_upload",
         )
 
@@ -85,13 +97,21 @@ with tab1:
 
         cutoff_ts = pd.Timestamp(fixed_cutoff)
 
+        # 우선순위: 수동 업로드(②) > 자동 인식(리포의 data/tableau_daily.csv)
+        existing = None
+        existing_source = None
         if existing_file is not None:
             try:
                 existing = pd.read_csv(existing_file, parse_dates=["date"])
+                existing_source = "업로드한 파일"
             except Exception as e:
                 st.error(f"기존 CSV 읽기 실패: {e}")
                 st.stop()
+        elif auto_found:
+            existing = pd.read_csv(_AUTO_TABLEAU_PATH, parse_dates=["date"])
+            existing_source = "리포의 data/tableau_daily.csv (자동 인식)"
 
+        if existing is not None:
             missing_cols = set(existing.columns) - set(result.columns)
             if missing_cols:
                 st.warning(f"⚠️ 기존 파일에는 있지만 새 원본엔 없는 컬럼: {sorted(missing_cols)} — 새 원본 기준 컬럼으로 맞춥니다.")
@@ -103,7 +123,7 @@ with tab1:
             result = pd.concat([fixed_part, new_part], ignore_index=True).sort_values("date").reset_index(drop=True)
 
             st.success(
-                f"병합 완료: 고정구간 {len(fixed_part):,}행"
+                f"병합 완료 (기존 파일 출처: {existing_source}): 고정구간 {len(fixed_part):,}행"
                 f"({fixed_part['date'].min().date() if len(fixed_part) else '-'}~{fixed_part['date'].max().date() if len(fixed_part) else '-'}) "
                 f"+ 신규구간 {len(new_part):,}행"
                 f"({new_part['date'].min().date() if len(new_part) else '-'}~{new_part['date'].max().date() if len(new_part) else '-'}) "
@@ -111,7 +131,7 @@ with tab1:
             )
         else:
             st.success(f"변환 완료: {len(result):,}행 · {result['date'].min().date()} ~ {result['date'].max().date()}")
-            st.caption("※ 기존 파일을 올리지 않아 전체를 새로 변환했습니다. 다음부터 고정구간 병합을 쓰려면 ②에 이 결과 파일을 올려주세요.")
+            st.caption("※ 기존 파일이 없어 전체를 새로 변환했습니다.")
 
         missing = check_missing_dates(result["date"])
         if missing:
