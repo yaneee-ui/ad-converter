@@ -19,8 +19,12 @@ st.caption("원본 리포트를 업로드하면 대시보드용 CSV를 만들어
 # data/tableau_daily.csv가 이미 디스크에 있으므로 매번 다시 업로드하지 않아도 자동으로 찾아 씁니다.
 _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 _AUTO_TABLEAU_PATH = os.path.join(_BASE_DIR, "data", "tableau_daily.csv")
+_AUTO_CATTXN_PATH = os.path.join(_BASE_DIR, "data", "category_brand_txn_daily.csv")
 
-tab1, tab2 = st.tabs(["① 일일리포트[태블로] (tableau_daily.csv)", "② 카테고리별 실적 (category_daily.csv)"])
+tab1, tab2 = st.tabs([
+    "① 일일리포트[태블로] (tableau_daily.csv)",
+    "② 카테고리·브랜드별 정상/이월/입점 (category_brand_txn_daily.csv)",
+])
 
 
 def to_csv_bytes(df: pd.DataFrame) -> bytes:
@@ -153,76 +157,136 @@ with tab1:
 
 
 # ════════════════════════════════════════════════════════════════
-# TAB 2: 카테고리별 실적 (네이버_쇼검_ep거래액_상세_XXXX.csv)
+# TAB 2: 카테고리별 정상/이월/입점 (태블로_정상이월입점_카테고리_RAW_YYYYMMDD.xlsx)
 # ════════════════════════════════════════════════════════════════
 with tab2:
+    auto_found2 = os.path.exists(_AUTO_CATTXN_PATH)
+
     st.markdown("""
-    **원본 파일**: `네이버_쇼검_ep거래액_상세_YYYYMMDD.csv` (카테고리별 쇼핑검색광고/EP채널 순결제거래액 상세, UTF-16 탭구분)
-    매번 전체 누적 기간이 다시 추출되는 형태이므로, 새로 받은 파일을 그대로 올리면 됩니다.
+    **원본 파일**: 태블로 카테고리·브랜드별 정상/이월/입점 RAW 엑셀
+    (헤더 3줄 + 결제_일자·정상이월구분명·영업상품카테고리명·SAP대표브랜드코드·거래액·주문고객수 컬럼,
+    광고/EP 각각. 병합셀 없이 매 행에 값이 채워진 형식을 자동으로 처리합니다.)
+
+    **고정 구간 + 증분 업데이트**: ①탭과 동일한 방식으로, 고정 기준일 이전은 기존 파일 값을
+    그대로 유지하고 이후만 새로 올린 원본 값으로 채우거나 덮어씁니다.
     """)
 
-    cat_file = st.file_uploader("원본 CSV 업로드 (.csv)", type=["csv"], key="cat_upload")
+    if auto_found2:
+        st.success("✅ 이 리포에 있는 `data/category_brand_txn_daily.csv`를 기존 파일로 자동 인식했습니다. 매번 다시 올리지 않아도 됩니다.")
+    else:
+        st.info("이 환경에서는 `data/category_brand_txn_daily.csv`를 찾지 못했습니다. 아래에 기존 파일을 직접 올려주세요.")
 
-    if cat_file is not None:
-        raw_bytes = cat_file.read()
-        text = None
-        for enc in ("utf-16", "utf-8-sig", "cp949"):
-            try:
-                text = raw_bytes.decode(enc)
-                break
-            except UnicodeDecodeError:
-                continue
+    c1, c2 = st.columns(2)
+    with c1:
+        cattxn_file = st.file_uploader("① 원본 엑셀 업로드 (.xlsx)", type=["xlsx"], key="cattxn_upload")
+    with c2:
+        existing_cattxn_file = st.file_uploader(
+            "② 기존 category_brand_txn_daily.csv 업로드 (자동 인식 안 될 때만)",
+            type=["csv"], key="existing_cattxn_upload",
+        )
 
-        if text is None:
-            st.error("파일 인코딩을 인식하지 못했습니다 (utf-16 / utf-8 / cp949 시도 실패). 원본 형식을 확인해주세요.")
-            st.stop()
+    cattxn_fixed_cutoff = st.date_input(
+        "🔒 고정 기준일 (이 날짜까지는 기존 파일 값을 그대로 유지)",
+        value=pd.Timestamp("2026-07-31"), key="cattxn_fixed_cutoff",
+    )
 
+    if cattxn_file is not None:
         try:
-            raw = pd.read_csv(io.StringIO(text), sep="\t", skiprows=2)
+            raw = pd.read_excel(cattxn_file, sheet_name=0, header=None, skiprows=3)
         except Exception as e:
-            st.error(f"CSV 파싱 실패: {e}")
+            st.error(f"엑셀 읽기 실패: {e}")
             st.stop()
 
-        expected_cols = ["ym", "ymd", "category", "광고_이월", "광고_입점", "광고_정상",
-                         "EP_이월", "EP_입점", "EP_정상"]
-        if raw.shape[1] != len(expected_cols):
+        expected_ncols = 8
+        if raw.shape[1] != expected_ncols:
             st.error(
-                f"컬럼 개수가 예상과 다릅니다 (예상 {len(expected_cols)}개, 실제 {raw.shape[1]}개). "
-                "원본 리포트 형식이 바뀌지 않았는지 확인해주세요."
+                f"컬럼 개수가 예상과 다릅니다 (예상 {expected_ncols}개, 실제 {raw.shape[1]}개). "
+                "원본 리포트 형식이 바뀌지 않았는지 확인해주세요. "
+                "(브랜드 컬럼이 없는 예전 7컬럼 형식이라면 이 탭이 아니라 이전 버전 변환기를 써야 합니다.)"
             )
             st.stop()
 
-        raw.columns = expected_cols
+        raw.columns = ["date_raw", "txn_type", "category", "brand",
+                       "ad_거래액", "ad_주문고객수", "ep_거래액", "ep_주문고객수"]
 
-        for c in ["광고_이월", "광고_입점", "광고_정상", "EP_이월", "EP_입점", "EP_정상"]:
-            raw[c] = raw[c].astype(str).str.replace(",", "").str.replace("nan", "0")
+        # 이 형식은 병합셀 없이 매 행에 날짜/거래유형이 채워져 있어 ffill이 필요 없지만,
+        # 혹시 모를 병합셀 케이스에도 대응할 수 있도록 안전하게 ffill 처리
+        raw["date_raw"] = raw["date_raw"].ffill()
+        raw["txn_type"] = raw["txn_type"].ffill()
+        raw["category"] = raw["category"].ffill()
+
+        try:
+            raw["date"] = pd.to_datetime(raw["date_raw"].astype(int).astype(str), format="%Y%m%d")
+        except Exception as e:
+            st.error(f"날짜 파싱 실패: {e}. '결제_일자(YYYYMMDD)' 형식이 맞는지 확인해주세요.")
+            st.stop()
+
+        for c in ["ad_거래액", "ad_주문고객수", "ep_거래액", "ep_주문고객수"]:
+            raw[c] = raw[c].astype(str).str.replace(",", "").replace("nan", "0")
             raw[c] = pd.to_numeric(raw[c], errors="coerce").fillna(0)
 
-        raw["date"] = pd.to_datetime(raw["ymd"], format="%Y%m%d")
-        result = raw[["date", "category"] + [c for c in expected_cols if c not in ("ym", "ymd", "category")]]
-        result = result.sort_values(["date", "category"]).reset_index(drop=True)
+        result = raw[["date", "txn_type", "category", "brand",
+                      "ad_거래액", "ad_주문고객수", "ep_거래액", "ep_주문고객수"]]
+        result = result.sort_values(["date", "txn_type", "category", "brand"]).reset_index(drop=True)
 
-        st.success(
-            f"변환 완료: {len(result):,}행 · {result['date'].min().date()} ~ {result['date'].max().date()} "
-            f"· 카테고리 {result['category'].nunique()}개"
-        )
+        cattxn_cutoff_ts = pd.Timestamp(cattxn_fixed_cutoff)
+
+        existing2 = None
+        existing2_source = None
+        if existing_cattxn_file is not None:
+            try:
+                existing2 = pd.read_csv(existing_cattxn_file, parse_dates=["date"])
+                existing2_source = "업로드한 파일"
+            except Exception as e:
+                st.error(f"기존 CSV 읽기 실패: {e}")
+                st.stop()
+        elif auto_found2:
+            existing2 = pd.read_csv(_AUTO_CATTXN_PATH, parse_dates=["date"])
+            existing2_source = "리포의 data/category_brand_txn_daily.csv (자동 인식)"
+
+        if existing2 is not None:
+            if "brand" not in existing2.columns:
+                st.warning("⚠️ 기존 파일에 브랜드 컬럼이 없습니다(구버전). 고정구간도 브랜드 없이 병합됩니다.")
+                existing2["brand"] = "전체"
+            fixed_part2 = existing2[existing2["date"] <= cattxn_cutoff_ts]
+            new_part2 = result[result["date"] > cattxn_cutoff_ts]
+            fixed_part2 = fixed_part2.reindex(columns=result.columns)
+            result = pd.concat([fixed_part2, new_part2], ignore_index=True)
+            result = result.sort_values(["date", "txn_type", "category", "brand"]).reset_index(drop=True)
+
+            st.success(
+                f"병합 완료 (기존 파일 출처: {existing2_source}): 고정구간 {len(fixed_part2):,}행"
+                f"({fixed_part2['date'].min().date() if len(fixed_part2) else '-'}~{fixed_part2['date'].max().date() if len(fixed_part2) else '-'}) "
+                f"+ 신규구간 {len(new_part2):,}행"
+                f"({new_part2['date'].min().date() if len(new_part2) else '-'}~{new_part2['date'].max().date() if len(new_part2) else '-'}) "
+                f"= 총 {len(result):,}행"
+            )
+        else:
+            st.success(
+                f"변환 완료: {len(result):,}행 · {result['date'].min().date()} ~ {result['date'].max().date()} "
+                f"· 카테고리 {result['category'].nunique()}개 · 브랜드 {result['brand'].nunique()}개 "
+                f"· 거래유형 {sorted(result['txn_type'].unique())}"
+            )
+            st.caption("※ 기존 파일이 없어 전체를 새로 변환했습니다.")
+
         st.caption(f"카테고리 목록: {', '.join(sorted(result['category'].unique()))}")
+        st.caption(f"브랜드 개수: {result['brand'].nunique()}개 (SAP 브랜드코드 기준. 입점 거래는 브랜드코드 대신 '입점'으로 표기됨)")
 
-        unique_dates = result["date"].drop_duplicates()
-        missing = check_missing_dates(unique_dates)
-        if missing:
-            st.warning(f"⚠️ 누락된 날짜 {len(missing)}개 발견: {[d.date().isoformat() for d in missing[:10]]}"
-                       + (" ..." if len(missing) > 10 else ""))
+        unique_dates2 = result["date"].drop_duplicates()
+        missing2 = check_missing_dates(unique_dates2)
+        if missing2:
+            st.warning(f"⚠️ 누락된 날짜 {len(missing2)}개 발견: {[d.date().isoformat() for d in missing2[:10]]}"
+                       + (" ..." if len(missing2) > 10 else ""))
         else:
             st.caption("✅ 날짜 누락 없음 (연속된 일자 확인 완료)")
 
         st.dataframe(result.head(10), use_container_width=True)
 
         st.download_button(
-            "📥 category_daily.csv 다운로드",
+            "📥 category_brand_txn_daily.csv 다운로드",
             data=to_csv_bytes(result),
-            file_name="category_daily.csv",
+            file_name="category_brand_txn_daily.csv",
             mime="text/csv",
-            key="dl_category",
+            key="dl_cattxn",
         )
-        st.info("다운로드한 파일로 GitHub 리포의 `data/category_daily.csv`를 교체(덮어쓰기)하면 됩니다.")
+        st.info("다운로드한 파일로 GitHub 리포의 `data/category_brand_txn_daily.csv`를 교체(덮어쓰기)하면 됩니다.")
